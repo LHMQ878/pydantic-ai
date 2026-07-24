@@ -4,7 +4,7 @@ from abc import ABC
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, Literal, TypeAlias, Union
+from typing import Annotated, Any, Literal, Union
 
 import pydantic
 from pydantic_core import core_schema
@@ -44,8 +44,6 @@ ImageAspectRatio = Literal['21:9', '16:9', '4:3', '3:2', '1:1', '9:16', '3:4', '
 
 ImageGenerationModelName = Literal['gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini'] | str
 """Known OpenAI image generation model names, or another OpenAI image model ID."""
-
-_ResponseInclusion: TypeAlias = Literal['full', 'excluded']
 
 AdvisorModelName = (
     Literal[
@@ -198,7 +196,7 @@ class WebSearchTool(AbstractNativeTool):
     * Anthropic
     """
 
-    response_inclusion: _ResponseInclusion | None = None
+    response_inclusion: Literal['full', 'excluded'] | None = None
     """Controls whether results consumed by completed code execution calls are included in the response.
 
     If `None`, Anthropic uses its default of `'full'`.
@@ -435,7 +433,7 @@ class WebFetchTool(AbstractNativeTool):
     * Anthropic
     """
 
-    response_inclusion: _ResponseInclusion | None = None
+    response_inclusion: Literal['full', 'excluded'] | None = None
     """Controls whether results consumed by completed code execution calls are included in the response.
 
     If `None`, Anthropic uses its default of `'full'`.
