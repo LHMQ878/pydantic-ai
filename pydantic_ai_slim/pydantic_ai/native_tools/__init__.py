@@ -207,6 +207,19 @@ class WebSearchTool(AbstractNativeTool):
     * Anthropic
     """
 
+    external_web_access: bool | None = None
+    """Whether the hosted web search tool may fetch live web content.
+
+    If `False`, the tool uses only cached or indexed results. If `None`, the parameter is omitted and the provider
+    default is used. OpenAI currently defaults to `True`.
+
+    Supported by:
+
+    * OpenAI Responses `web_search` tool, see <https://developers.openai.com/api/docs/guides/tools-web-search#live-internet-access>
+
+    OpenAI's legacy `web_search_preview` tool ignores this parameter.
+    """
+
     kind: str = 'web_search'
     """The kind of tool."""
 

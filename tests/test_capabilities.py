@@ -1532,6 +1532,11 @@ def test_model_json_schema_with_capabilities():
                             'default': None,
                             'title': 'Response Inclusion',
                         },
+                        'external_web_access': {
+                            'anyOf': [{'type': 'boolean'}, {'type': 'null'}],
+                            'default': None,
+                            'title': 'External Web Access',
+                        },
                     },
                     'title': 'WebSearchTool',
                     'type': 'object',
@@ -2015,6 +2020,10 @@ def test_model_json_schema_with_capabilities():
                         'response_inclusion': {
                             'anyOf': [{'enum': ['full', 'excluded'], 'type': 'string'}, {'type': 'null'}],
                             'title': 'Response Inclusion',
+                        },
+                        'external_web_access': {
+                            'anyOf': [{'type': 'boolean'}, {'type': 'null'}],
+                            'title': 'External Web Access',
                         },
                         'id': {'anyOf': [{'type': 'string'}, {'type': 'null'}], 'title': 'Id'},
                         'defer_loading': {'title': 'Defer Loading', 'type': 'boolean'},
@@ -10094,6 +10103,7 @@ def test_web_search_with_constraints():
         allowed_domains=['good.com'],
         max_uses=3,
         response_inclusion='excluded',
+        external_web_access=False,
     )
     builtin_tools = cap.get_native_tools()
     assert len(builtin_tools) == 1
@@ -10105,7 +10115,22 @@ def test_web_search_with_constraints():
     assert tool.allowed_domains == ['good.com']
     assert tool.max_uses == 3
     assert tool.response_inclusion == 'excluded'
+    assert tool.external_web_access is False
     assert cap._requires_native() is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_web_search_external_access_constraint():
+    """Disabling live access suppresses local fallback; allowing it does not."""
+    without_access = WebSearch(local=_noop_greet, external_web_access=False)
+    assert without_access._requires_native() is True  # pyright: ignore[reportPrivateUsage]
+    assert without_access.get_toolset() is None
+
+    with_access = WebSearch(local=_noop_greet, external_web_access=True)
+    assert with_access._requires_native() is False  # pyright: ignore[reportPrivateUsage]
+    assert with_access.get_toolset() is not None
+
+    with pytest.raises(UserError, match='constraint fields require the native tool'):
+        WebSearch(native=False, local=_noop_greet, external_web_access=False)
 
 
 def test_web_search_duckduckgo_raises_without_extra(monkeypatch: pytest.MonkeyPatch):

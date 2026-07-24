@@ -97,6 +97,7 @@ def test_model_request_parameters_are_serializable():
                     'allowed_domains': None,
                     'max_uses': None,
                     'response_inclusion': None,
+                    'external_web_access': None,
                 },
                 {'kind': 'code_execution', 'optional': False, 'files': None},
                 {
