@@ -21,13 +21,16 @@ from __future__ import annotations as _annotations
 
 import asyncio
 import sys
+import threading
 from collections.abc import AsyncIterable
 from typing import Any
 
 import anyio
 import pytest
+from anyio import to_thread
+from anyio.from_thread import start_blocking_portal
 
-from pydantic_ai import Agent, AgentRunResultEvent, RunCancelled, UserError, capture_run_messages
+from pydantic_ai import Agent, AgentRunEvents, AgentRunResultEvent, RunCancelled, UserError, capture_run_messages
 from pydantic_ai._cancel import RunCancellation
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
@@ -559,6 +562,83 @@ async def test_run_stream_events_cancel_from_sibling_task():
             await asyncio.wait_for(consumer, timeout=READINESS_WAIT_TIMEOUT)
 
 
+async def test_concurrent_run_stream_events_handles_do_not_cross_consume():
+    """Concurrent lazy runs created in the same context retain their own bindings."""
+    started = {'first': asyncio.Event(), 'second': asyncio.Event()}
+    finish_second = asyncio.Event()
+    agents = {'first': Agent(TestModel()), 'second': Agent(TestModel())}
+
+    @agents['first'].tool_plain
+    async def block_first() -> str:
+        started['first'].set()
+        await asyncio.Event().wait()
+        return 'never reached'  # pragma: no cover
+
+    @agents['second'].tool_plain
+    async def block_second() -> str:
+        started['second'].set()
+        await finish_second.wait()
+        return 'second complete'
+
+    handles: dict[str, AgentRunEvents[str]] = {}
+
+    async def consume(name: str) -> AgentRunResultEvent[str]:
+        async with agents[name].run_stream_events(name) as events:
+            handles[name] = events
+            result_event: AgentRunResultEvent[str] | None = None
+            async for event in events:
+                if isinstance(event, AgentRunResultEvent):
+                    result_event = event
+            assert result_event is not None
+            return result_event
+
+    first_consumer = asyncio.create_task(consume('first'))
+    second_consumer = asyncio.create_task(consume('second'))
+    await asyncio.wait_for(
+        asyncio.gather(started['first'].wait(), started['second'].wait()), timeout=READINESS_WAIT_TIMEOUT
+    )
+    handles['first'].cancel()
+    finish_second.set()
+
+    with pytest.raises(RunCancelled):
+        await asyncio.wait_for(first_consumer, timeout=READINESS_WAIT_TIMEOUT)
+    second_result_event = await asyncio.wait_for(second_consumer, timeout=READINESS_WAIT_TIMEOUT)
+
+    second_events = handles['second']
+    assert second_result_event.result.output == '{"block_second":"second complete"}'
+    assert second_events.result is second_result_event.result
+    assert any(
+        isinstance(part, ToolReturnPart) and part.content == 'second complete'
+        for message in second_events.all_messages()
+        for part in message.parts
+    )
+
+
+async def test_run_stream_events_cancel_from_worker_thread():
+    """The documented loop marshalling pattern cancels a run from a worker thread."""
+    started = asyncio.Event()
+    agent = Agent(TestModel())
+
+    @agent.tool_plain
+    async def slow_tool() -> str:
+        started.set()
+        await asyncio.Event().wait()
+        return 'never reached'  # pragma: no cover
+
+    loop = asyncio.get_running_loop()
+    async with agent.run_stream_events('go') as events:
+        consumer = asyncio.create_task(_consume_events(events))
+        await asyncio.wait_for(started.wait(), timeout=READINESS_WAIT_TIMEOUT)
+        worker = threading.Thread(target=loop.call_soon_threadsafe, args=(events.cancel,))
+        worker.start()
+        await to_thread.run_sync(worker.join)
+
+        with pytest.raises(RunCancelled) as exc_info:
+            await asyncio.wait_for(consumer, timeout=READINESS_WAIT_TIMEOUT)
+
+    assert exc_info.value.messages
+
+
 async def _consume_events(events: AsyncIterable[AgentStreamEvent | AgentRunResultEvent[Any]]) -> None:
     async for _event in events:
         pass
@@ -671,6 +751,90 @@ async def test_run_stream_events_binding_does_not_leak_to_nested_run():
             await asyncio.wait_for(consumer, timeout=READINESS_WAIT_TIMEOUT)
 
     assert inner_completed.is_set()
+
+
+async def test_run_stream_events_binding_across_blocking_portal():
+    """Bindings reach a portal loop, including cancellation marshalled from the outer thread."""
+
+    def run_portal_cases() -> None:
+        with start_blocking_portal() as portal:
+            completed_agent = Agent(TestModel(custom_output_text='portal complete'))
+
+            async def consume_completed() -> AgentRunResultEvent[str]:
+                async with completed_agent.run_stream_events('go') as events:
+                    result_event: AgentRunResultEvent[str] | None = None
+                    async for event in events:
+                        if isinstance(event, AgentRunResultEvent):
+                            result_event = event
+                    assert events.result is not None
+                    assert events.all_messages()
+                    assert result_event is not None
+                    return result_event
+
+            result_event = portal.call(consume_completed)
+            assert result_event.result.output == 'portal complete'
+
+            started = threading.Event()
+            handles: list[AgentRunEvents[str]] = []
+            cancelled_agent = Agent(TestModel())
+
+            @cancelled_agent.tool_plain
+            async def slow_tool() -> str:
+                started.set()
+                await asyncio.Event().wait()
+                return 'never reached'  # pragma: no cover
+
+            async def consume_cancelled() -> None:
+                async with cancelled_agent.run_stream_events('go') as events:
+                    handles.append(events)
+                    await _consume_events(events)
+
+            future = portal.start_task_soon(consume_cancelled)
+            assert started.wait(timeout=READINESS_WAIT_TIMEOUT)
+            portal.call(handles[0].cancel)
+
+            with pytest.raises(RunCancelled) as exc_info:
+                future.result(timeout=READINESS_WAIT_TIMEOUT)
+            assert exc_info.value.messages
+
+    await to_thread.run_sync(run_portal_cases)
+
+
+async def test_nested_run_stream_events_binding_isolated_under_outer_cancellation():
+    """Cancelling an outer handle remains external cancellation to a nested handle."""
+    inner_started = asyncio.Event()
+    inner_outcome: list[str] = []
+    inner_agent = Agent(TestModel())
+    outer_agent = Agent(TestModel())
+
+    @inner_agent.tool_plain
+    async def inner_slow_tool() -> str:
+        inner_started.set()
+        await asyncio.Event().wait()
+        return 'never reached'  # pragma: no cover
+
+    @outer_agent.tool_plain
+    async def nested_run() -> str:
+        try:
+            async with inner_agent.run_stream_events('inner') as inner_events:
+                await _consume_events(inner_events)
+        except asyncio.CancelledError:
+            inner_outcome.append('tool cancelled')
+            raise
+        except RunCancelled:
+            inner_outcome.append('inner run cancelled')  # pragma: no cover
+            raise
+        return 'never reached'  # pragma: no cover
+
+    async with outer_agent.run_stream_events('outer') as outer_events:
+        consumer = asyncio.create_task(_consume_events(outer_events))
+        await asyncio.wait_for(inner_started.wait(), timeout=READINESS_WAIT_TIMEOUT)
+        outer_events.cancel()
+        with pytest.raises(RunCancelled) as exc_info:
+            await asyncio.wait_for(consumer, timeout=READINESS_WAIT_TIMEOUT)
+
+    assert inner_outcome == ['tool cancelled']
+    assert exc_info.value.messages
 
 
 @requires_task_cancelling
