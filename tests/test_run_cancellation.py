@@ -650,8 +650,8 @@ async def test_run_stream_events_cancel_before_iteration():
 
     def model_func(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         nonlocal model_calls
-        model_calls += 1
-        return ModelResponse(parts=[TextPart('done')])
+        model_calls += 1  # pragma: no cover - the pre-start cancel must prevent any model call
+        return ModelResponse(parts=[TextPart('done')])  # pragma: no cover
 
     agent = Agent(FunctionModel(model_func))
     received: list[AgentStreamEvent | AgentRunResultEvent[str]] = []
@@ -660,7 +660,7 @@ async def test_run_stream_events_cancel_before_iteration():
         with pytest.raises(RunCancelled) as exc_info:
             events.cancel()
             async for event in events:
-                received.append(event)
+                received.append(event)  # pragma: no cover - no events may be delivered
 
         assert received == []
         assert model_calls == 0
@@ -821,8 +821,8 @@ async def test_nested_run_stream_events_binding_isolated_under_outer_cancellatio
         except asyncio.CancelledError:
             inner_outcome.append('tool cancelled')
             raise
-        except RunCancelled:
-            inner_outcome.append('inner run cancelled')  # pragma: no cover
+        except RunCancelled:  # pragma: no cover - the inner handle must not claim the outer cancel
+            inner_outcome.append('inner run cancelled')
             raise
         return 'never reached'  # pragma: no cover
 
