@@ -839,6 +839,61 @@ async def test_nested_run_stream_events_binding_isolated_under_outer_cancellatio
     assert exc_info.value.messages
 
 
+async def test_nested_run_in_for_run_hook_does_not_steal_binding():
+    """A nested agent run started from a capability `for_run()` hook must not consume the
+    outer `AgentRunEvents` handle's binding: the binding is taken before any lifecycle hook runs."""
+    inner_agent = Agent(TestModel(custom_output_text='inner done'))
+    outer_started = asyncio.Event()
+    inner_outputs: list[str] = []
+
+    class RunsAgentInForRun(AbstractCapability):
+        async def for_run(self, ctx: RunContext) -> RunsAgentInForRun:
+            result = await inner_agent.run('inner')
+            inner_outputs.append(result.output)
+            return self
+
+    outer_agent = Agent(TestModel(), capabilities=[RunsAgentInForRun()])
+
+    @outer_agent.tool_plain
+    async def outer_slow_tool() -> str:
+        outer_started.set()
+        await asyncio.Event().wait()
+        return 'never reached'  # pragma: no cover
+
+    async with outer_agent.run_stream_events('outer') as events:
+        consumer = asyncio.create_task(_consume_events(events))
+        await asyncio.wait_for(outer_started.wait(), timeout=READINESS_WAIT_TIMEOUT)
+        events.cancel()
+        with pytest.raises(RunCancelled) as exc_info:
+            await asyncio.wait_for(consumer, timeout=READINESS_WAIT_TIMEOUT)
+
+    assert inner_outputs == ['inner done']
+    assert exc_info.value.messages
+
+
+async def test_cancel_during_blocked_before_run_is_delivered():
+    """`events.cancel()` while a `before_run` hook is blocked must interrupt it promptly —
+    the controller is bound before `wrap_run`/`before_run` start, and the translation funnel
+    covers all of setup."""
+    hook_blocked = asyncio.Event()
+
+    class BlockingBeforeRun(AbstractCapability):
+        async def before_run(self, ctx: RunContext) -> None:
+            hook_blocked.set()
+            await asyncio.Event().wait()  # blocks until cancelled
+
+    agent = Agent(TestModel(), capabilities=[BlockingBeforeRun()])
+
+    async with agent.run_stream_events('go') as events:
+        consumer = asyncio.create_task(_consume_events(events))
+        await asyncio.wait_for(hook_blocked.wait(), timeout=READINESS_WAIT_TIMEOUT)
+        events.cancel()
+        with pytest.raises(RunCancelled) as exc_info:
+            await asyncio.wait_for(consumer, timeout=READINESS_WAIT_TIMEOUT)
+
+    assert exc_info.value.messages == []  # cancelled before any model request
+
+
 @requires_task_cancelling
 async def test_first_party_cancel_swallowed_by_after_run_is_typed():
     """A first-party cancellation absorbed by `after_run` is typed at the outer funnel."""

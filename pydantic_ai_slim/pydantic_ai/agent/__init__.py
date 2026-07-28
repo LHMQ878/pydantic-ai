@@ -1104,6 +1104,11 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         if infer_name and self.name is None:
             self._infer_name(inspect.currentframe())
 
+        # Consume the pending `AgentRunEvents` binding before ANY user-supplied code (capability /
+        # toolset `for_run()` hooks below) runs in this context: a hook that starts a nested agent
+        # run would otherwise consume it and attach the outer handle to the wrong run.
+        binding = _cancel.take_run_binding()
+
         # A bare `int` overrides both budgets; a partial `retries={'tools': ...}` / `{'output': ...}`
         # dict overrides only the named budget for this run (riding `ToolManager.default_max_retries`).
         retry_overrides = _normalize_agent_retry_overrides(retries)
@@ -1532,8 +1537,6 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         loaded_capability_ids = parse_loaded_capabilities(message_history) if message_history else set[str]()
         discovered_tool_names = parse_discovered_tools(message_history) if message_history else set[str]()
 
-        binding = _cancel.take_run_binding()
-
         run_model_contribution = None if model_is_explicit else run_capability.get_model()
         self._check_dynamic_model_resume(run_model_contribution, message_history)
         model_selector: ModelSelector[AgentDepsT] | None
@@ -1679,9 +1682,12 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             agent_run = AgentRun(graph_run)
             if binding is not None:
                 binding.agent_run = agent_run
+            # Bind the run's cancellation controller to this task before `wrap_run`/`before_run`
+            # start, so a `cancel()` issued while a lifecycle hook is still running (or blocked)
+            # is delivered immediately — the translation funnel entered above covers all of setup.
             # Neutralize `cancel()` once the run is over so it can never cancel unrelated later
-            # work on this task. Binding happens immediately before the run is handed to its
-            # driver, ensuring a pre-start request lands at a run boundary that can translate it.
+            # work on this task.
+            graph_deps.cancellation.bind()
             stack.callback(graph_deps.cancellation.finish)
             self._resolve_and_store_metadata(agent_run.ctx, metadata)
 
@@ -1789,7 +1795,6 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             if _short_circuited:
                 await _finalize_result(_wrap_task.result())
 
-            graph_deps.cancellation.bind()
             try:
                 yield agent_run
             except BaseException as _exc:
