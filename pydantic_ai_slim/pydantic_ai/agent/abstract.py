@@ -158,7 +158,7 @@ class AgentRunEvents(
             raise StopAsyncIteration
 
         if self._task is None and self._binding.cancellation.cancel_requested:
-            raise RunCancelled('The agent run was cancelled.', messages=[])
+            raise RunCancelled('The agent run was cancelled.')
 
         await self._ensure_started()
         assert self._receive_stream is not None
