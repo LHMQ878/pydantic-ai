@@ -214,6 +214,23 @@ class AgentRunEvents(
             raise exceptions.UserError('The run has not started; iterate the events first.')
         return agent_run
 
+    def _attach_run_state(self, exc: BaseException) -> None:
+        """Attach the run's state to an external cancellation of the consumer task.
+
+        The background run's own `CancelledError` (carrying the state attached by the translation
+        funnel) is consumed by `aclose()`'s drain, so the state is rebuilt from the live run and
+        attached to the consumer's propagating exception for `RunCancelled.from_cancellation()`.
+        No-op if the run never started.
+        """
+        agent_run = self._binding.agent_run
+        if agent_run is None:
+            return
+        _agent_graph.run_cancelled_snapshot(
+            'The agent run was cancelled by an external asyncio cancellation.',
+            agent_run.ctx.state,
+            agent_run.ctx.deps,
+        )._attach_to(exc)  # pyright: ignore[reportPrivateUsage]
+
     async def aclose(self) -> None:
         """Cancel the background run (if started) and close the receive stream, idempotently."""
         if self._closed:
@@ -290,6 +307,11 @@ class _RunStreamEventsContext(Generic[OutputDataT], AbstractAsyncContextManager[
     ) -> None:
         if self._iterator is not None:
             await self._iterator.aclose()
+            # An external cancellation of the consumer task keeps propagating as `CancelledError`;
+            # ride the run state along on it, mirroring the translation funnel's behavior for
+            # `run()`/`iter()`. Attached after `aclose()` so teardown-committed history is included.
+            if isinstance(exc_value, asyncio.CancelledError):
+                self._iterator._attach_run_state(exc_value)  # pyright: ignore[reportPrivateUsage]
 
 
 class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
