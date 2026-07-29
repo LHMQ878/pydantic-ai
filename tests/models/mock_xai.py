@@ -34,12 +34,18 @@ def _serialize_content(content: ToolCallOutputType) -> str:
 
 
 def _get_proto_finish_reason(finish_reason: FinishReason) -> sample_pb2.FinishReason:
-    """Map pydantic-ai FinishReason to xAI proto FinishReason."""
+    """Map pydantic-ai FinishReason to xAI proto FinishReason.
+
+    `error` maps to `REASON_TIME_LIMIT` because that is the only proto reason pydantic-ai
+    reports as an error. `content_filter` has no proto equivalent at all -- xAI's enum has
+    no such member -- so it maps to `REASON_STOP`, matching what the API would send.
+    """
     return {
         'stop': sample_pb2.FinishReason.REASON_STOP,
         'length': sample_pb2.FinishReason.REASON_MAX_LEN,
         'tool_call': sample_pb2.FinishReason.REASON_TOOL_CALLS,
         'content_filter': sample_pb2.FinishReason.REASON_STOP,
+        'error': sample_pb2.FinishReason.REASON_TIME_LIMIT,
     }.get(finish_reason, sample_pb2.FinishReason.REASON_STOP)
 
 
@@ -199,17 +205,23 @@ def create_logprob(
 def create_response(
     content: str = '',
     tool_calls: list[chat_pb2.ToolCall] | None = None,
-    finish_reason: FinishReason = 'stop',
+    finish_reason: FinishReason | None = 'stop',
     usage: Any | None = None,
     reasoning_content: str = '',
     encrypted_content: str = '',
     logprobs: list[chat_pb2.LogProb] | None = None,
     index: int = 0,
 ) -> chat_types.Response:
-    """Create a Response with a single output."""
+    """Create a Response with a single output.
+
+    `finish_reason=None` yields `REASON_INVALID`, the proto default, which is what an
+    accumulated `Response` carries partway through a stream.
+    """
     output = chat_pb2.CompletionOutput(
         index=index,
-        finish_reason=_get_proto_finish_reason(finish_reason),
+        finish_reason=(
+            _get_proto_finish_reason(finish_reason) if finish_reason else sample_pb2.FinishReason.REASON_INVALID
+        ),
         message=chat_pb2.CompletionMessage(
             content=content,
             role=chat_pb2.MessageRole.ROLE_ASSISTANT,
@@ -354,7 +366,7 @@ def get_grok_tool_chunk(
     response = create_response(
         content='',
         tool_calls=response_tool_calls,
-        finish_reason=finish_reason if finish_reason else 'stop',  # type: ignore[arg-type]
+        finish_reason=finish_reason or None,  # type: ignore[arg-type]
         usage=usage,
     )
 
@@ -375,7 +387,7 @@ def get_grok_text_chunk(text: str, finish_reason: str = 'stop') -> tuple[chat_ty
     usage = usage_pb2.SamplingUsage(prompt_tokens=2, completion_tokens=1) if finish_reason else None
     response = create_response(
         content=text,
-        finish_reason=finish_reason if finish_reason else 'stop',  # type: ignore[arg-type]
+        finish_reason=finish_reason or None,  # type: ignore[arg-type]
         usage=usage,
     )
 
@@ -399,7 +411,7 @@ def get_grok_reasoning_text_chunk(
     usage = usage_pb2.SamplingUsage(prompt_tokens=2, completion_tokens=1) if finish_reason else None
     response = create_response(
         content=text,
-        finish_reason=finish_reason if finish_reason else 'stop',  # type: ignore[arg-type]
+        finish_reason=finish_reason or None,  # type: ignore[arg-type]
         usage=usage,
         reasoning_content=reasoning_content,
         encrypted_content=encrypted_content,

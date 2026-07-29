@@ -65,6 +65,7 @@ from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import (
     CachePoint,
+    FinishReason,
     UploadedFile,
 )
 from pydantic_ai.models import ModelRequestParameters, ToolDefinition
@@ -99,7 +100,7 @@ from .mock_xai import (
 with try_import() as imports_successful:
     import xai_sdk.chat as chat_types
     from xai_sdk.chat import required_tool
-    from xai_sdk.proto import chat_pb2, usage_pb2
+    from xai_sdk.proto import chat_pb2, sample_pb2, usage_pb2
 
     from pydantic_ai.models import xai as xai_module
     from pydantic_ai.models.xai import (
@@ -1399,6 +1400,70 @@ async def test_xai_stream_text_finish_reason(allow_model_requests: None):
                     finish_reason='stop',
                 )
             )
+
+
+@pytest.mark.parametrize(
+    'finish_reason,expected',
+    [
+        ('stop', 'stop'),
+        ('length', 'length'),
+        ('tool_call', 'tool_call'),
+        ('error', 'error'),
+    ],
+)
+async def test_xai_stream_finish_reason_matches_non_streaming(
+    allow_model_requests: None, finish_reason: FinishReason, expected: FinishReason
+):
+    """Streaming and non-streaming must agree on the finish reason for the same response.
+
+    `Response.finish_reason` is `FinishReason.Name(...)` of the proto enum, so it yields
+    `'REASON_MAX_LEN'` rather than `'length'`. The streaming path used to look that up in a
+    map keyed on lowercase strings, so nothing ever matched and every streamed response
+    reported `'stop'` via the default.
+    """
+    response = create_response(content='hi', finish_reason=finish_reason, usage=create_usage())
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=MockXai.create_mock([response])))
+    non_streamed = await m.request([ModelRequest(parts=[UserPromptPart(content='')])], {}, ModelRequestParameters())
+
+    stream = [get_grok_text_chunk('h', ''), get_grok_text_chunk('i', finish_reason)]
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=MockXai.create_mock_stream([stream])))
+    async with Agent(m).run_stream('') as result:
+        async for _ in result.stream_text(debounce_by=None):
+            pass
+        streamed = [response async for response in result.stream_response(debounce_by=None)][-1]
+
+    assert streamed.finish_reason == expected
+    assert streamed.finish_reason == non_streamed.finish_reason
+
+
+async def test_xai_stream_finish_reason_is_none_until_the_stream_finishes(allow_model_requests: None):
+    """Intermediate chunks carry `REASON_INVALID` (the proto default), i.e. "not finished yet".
+
+    Defaulting those to `'stop'` asserts a clean stop on a response that is still arriving.
+    """
+    stream = [get_grok_text_chunk('a', ''), get_grok_text_chunk('b', ''), get_grok_text_chunk('c', 'length')]
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=MockXai.create_mock_stream([stream])))
+
+    async with Agent(m).run_stream('') as result:
+        seen = [(response.text, response.finish_reason) async for response in result.stream_response(debounce_by=None)]
+
+    # `None` while the text is still growing, `'length'` only once the final chunk arrives.
+    assert [reason for text, reason in seen if text != 'abc'] == snapshot([None, None])
+    assert seen[-1] == snapshot(('abc', 'length'))
+
+
+def test_xai_finish_reason_map_covers_every_proto_reason():
+    """Every reason the SDK can send must be mapped, except the "not finished" default.
+
+    A missing entry is silently indistinguishable from "still streaming", so this guards
+    against the enum growing a member that then reads as an unfinished response.
+    """
+    unmapped = {
+        sample_pb2.FinishReason.Name(number)
+        for number in sample_pb2.FinishReason.values()
+        if number not in xai_module._FINISH_REASON_PROTO_MAP  # pyright: ignore[reportPrivateUsage]
+    }
+    assert unmapped == {'REASON_INVALID'}
 
 
 class MyTypedDict(TypedDict, total=False):
