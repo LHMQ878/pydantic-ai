@@ -419,6 +419,42 @@ def resolve_redirect_url(current_url: str, location: str) -> str:
         return urlunparse((parsed_current.scheme, parsed_current.netloc, f'{base_path}/{location}', '', '', ''))
 
 
+def _origin(url: str) -> tuple[str, str, int]:
+    """The (scheme, host, port) origin of a URL, with the port defaulted from the scheme.
+
+    Mirrors `httpx.Client._same_origin`: an origin is scheme + host + port, not host
+    alone. The trailing dot of an FQDN is stripped so `host.` and `host` -- which DNS
+    treats as the same name -- compare equal, matching `extract_host_and_port`.
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or '').rstrip('.')
+    port = parsed.port or (443 if scheme == 'https' else 80)
+    return scheme, host, port
+
+
+def _keeps_credentials(from_url: str, to_url: str) -> bool:
+    """Whether sensitive headers may survive a redirect from `from_url` to `to_url`.
+
+    Same-origin redirects keep them. So does a plain http -> https upgrade of the same
+    host, which strictly increases confidentiality. Everything else -- a different host,
+    a different port, and in particular an https -> http *downgrade* that would put the
+    credential on the wire in cleartext -- drops them. This is `httpx`'s own rule
+    (`_same_origin` or `_is_https_redirect`); `safe_download` passes
+    `follow_redirects=False` and follows redirects itself, so it has to apply the rule
+    itself too.
+    """
+    from_scheme, from_host, from_port = _origin(from_url)
+    to_scheme, to_host, to_port = _origin(to_url)
+
+    if from_host != to_host:
+        return False
+    if (from_scheme, from_port) == (to_scheme, to_port):
+        return True
+    # http -> https upgrade on the default ports.
+    return (from_scheme, from_port, to_scheme, to_port) == ('http', 80, 'https', 443)
+
+
 def _check_domain(hostname: str, *, allowed_domains: list[str] | None, blocked_domains: list[str] | None) -> None:
     """Validate a hostname against allowed/blocked domain lists.
 
@@ -475,7 +511,6 @@ async def safe_download(
     """
     current_url = url
     redirects_followed = 0
-    original_hostname = urlparse(url).hostname
     effective_headers: dict[str, str] = dict(headers) if headers else {}
 
     async with create_async_http_client(timeout=timeout) as client:
@@ -517,11 +552,13 @@ async def safe_download(
                 if not location:
                     raise ValueError('Redirect response missing Location header')
 
+                previous_url = current_url
                 current_url = resolve_redirect_url(current_url, location)
 
-                # Strip sensitive headers on cross-origin redirects (RFC 7235)
-                redirect_hostname = urlparse(current_url).hostname
-                if redirect_hostname != original_hostname:
+                # Strip sensitive headers on cross-origin redirects (RFC 7235). Compared
+                # against the hop that issued the redirect, not the first URL, so a
+                # credential dropped earlier in the chain is never reinstated.
+                if not _keeps_credentials(previous_url, current_url):
                     effective_headers = {
                         k: v for k, v in effective_headers.items() if k.lower() not in _SENSITIVE_HEADERS
                     }

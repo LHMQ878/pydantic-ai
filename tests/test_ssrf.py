@@ -25,6 +25,8 @@ from pydantic_ai._ssrf import (
 
 pytestmark = [pytest.mark.anyio]
 
+_TWO_PUBLIC_IPS = ('93.184.215.14', '140.82.114.4')
+
 
 @pytest.fixture
 def mock_dns(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
@@ -927,6 +929,145 @@ class TestSafeDownload:
 
         with pytest.raises(ValueError, match='not in the allowed domains'):
             await safe_download('https://example.com/page', allowed_domains=['example.com'])
+
+
+class TestRedirectCredentialHandling:
+    """Tests for stripping sensitive headers across redirects.
+
+    The origin of a URL is scheme + host + port, so comparing hostnames alone both
+    leaked credentials (port change, https -> http downgrade) and stripped them
+    needlessly (trailing-dot FQDN).
+    """
+
+    @staticmethod
+    def _two_hops(
+        mock_dns: AsyncMock, mock_ssrf_client: MagicMock, location: str, ips: tuple[str, str] = _TWO_PUBLIC_IPS
+    ) -> AsyncMock:
+        """Wire up a client that redirects once to `location`, then succeeds."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': location}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        mock_dns.side_effect = [[(2, 1, 6, '', (ip, 0))] for ip in ips]
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [redirect_response, final_response]
+        mock_ssrf_client.return_value = mock_client
+        return mock_client
+
+    async def test_https_to_http_downgrade_strips_credentials(
+        self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock
+    ) -> None:
+        """A downgrade to plaintext must not put the credential on the wire."""
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, 'http://example.com/file.txt')
+
+        await safe_download(
+            'https://example.com/file.txt',
+            headers={'Authorization': 'Bearer SECRET-TOKEN', 'Cookie': 'session=abc', 'Accept': '*/*'},
+        )
+
+        second_hop_headers = mock_client.get.call_args_list[1][1]['headers']
+        assert 'Authorization' not in second_hop_headers
+        assert 'Cookie' not in second_hop_headers
+        # Non-sensitive headers are kept.
+        assert second_hop_headers['Accept'] == '*/*'
+
+    async def test_port_change_strips_credentials(self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock) -> None:
+        """A different port on the same host is a different origin, and often a different service."""
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, 'https://example.com:8443/file.txt')
+
+        await safe_download('https://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        assert 'Authorization' not in mock_client.get.call_args_list[1][1]['headers']
+
+    async def test_trailing_dot_is_the_same_origin(self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock) -> None:
+        """`example.com.` and `example.com` are the same DNS name, so headers are kept."""
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, 'https://example.com./other.txt')
+
+        await safe_download('https://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        assert mock_client.get.call_args_list[1][1]['headers']['Authorization'] == 'Bearer SECRET-TOKEN'
+
+    async def test_http_to_https_upgrade_keeps_credentials(
+        self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock
+    ) -> None:
+        """An upgrade to TLS on the same host only increases confidentiality."""
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, 'https://example.com/file.txt')
+
+        await safe_download('http://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        assert mock_client.get.call_args_list[1][1]['headers']['Authorization'] == 'Bearer SECRET-TOKEN'
+
+    async def test_same_origin_redirect_keeps_credentials(
+        self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock
+    ) -> None:
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, '/elsewhere/file.txt')
+
+        await safe_download('https://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        assert mock_client.get.call_args_list[1][1]['headers']['Authorization'] == 'Bearer SECRET-TOKEN'
+
+    async def test_cross_host_redirect_strips_credentials(
+        self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock
+    ) -> None:
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, 'https://cdn.other.com/file.txt')
+
+        await safe_download('https://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        assert 'Authorization' not in mock_client.get.call_args_list[1][1]['headers']
+
+    async def test_credentials_are_not_reinstated_by_a_later_hop(
+        self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock
+    ) -> None:
+        """example.com -> other.com -> example.com must not hand the credential back.
+
+        Comparing every hop against the *first* URL would restore it on the third hop.
+        """
+        first = AsyncMock()
+        first.is_redirect = True
+        first.headers = {'location': 'https://other.com/hop'}
+
+        second = AsyncMock()
+        second.is_redirect = True
+        second.headers = {'location': 'https://example.com/back'}
+
+        third = AsyncMock()
+        third.is_redirect = False
+        third.raise_for_status = lambda: None
+        third.content = b'final content'
+
+        mock_dns.side_effect = [
+            [(2, 1, 6, '', ('93.184.215.14', 0))],
+            [(2, 1, 6, '', ('140.82.114.4', 0))],
+            [(2, 1, 6, '', ('93.184.215.14', 0))],
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [first, second, third]
+        mock_ssrf_client.return_value = mock_client
+
+        await safe_download('https://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        assert mock_client.get.call_count == 3
+        assert 'Authorization' not in mock_client.get.call_args_list[2][1]['headers']
+
+    async def test_host_header_and_sni_still_follow_the_current_hop(
+        self, mock_dns: AsyncMock, mock_ssrf_client: MagicMock
+    ) -> None:
+        """Stripping credentials must not disturb Host/SNI handling."""
+        mock_client = self._two_hops(mock_dns, mock_ssrf_client, 'https://cdn.other.com/file.txt')
+
+        await safe_download('https://example.com/file.txt', headers={'Authorization': 'Bearer SECRET-TOKEN'})
+
+        second_hop = mock_client.get.call_args_list[1]
+        assert '140.82.114.4' in second_hop[0][0]
+        assert second_hop[1]['headers']['Host'] == 'cdn.other.com'
+        assert second_hop[1]['extensions'] == {'sni_hostname': 'cdn.other.com'}
 
 
 class TestDnsRebindingPrevention:
