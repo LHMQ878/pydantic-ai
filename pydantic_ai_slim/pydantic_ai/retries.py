@@ -359,14 +359,23 @@ def wait_retry_after(
             retry_after = exc.response.headers.get('retry-after')
             if retry_after:
                 try:
-                    # Try parsing as seconds first
+                    # Try parsing as seconds first. Negative delta-seconds aren't defined by
+                    # RFC 9110, and returning one makes tenacity call `time.sleep` with a
+                    # negative duration, which raises `ValueError` and masks the HTTP error.
+                    # `float()` raises `OverflowError` for an integer too large to represent.
                     wait_seconds = int(retry_after)
-                    return min(float(wait_seconds), max_wait)
-                except ValueError:
+                    if wait_seconds >= 0:
+                        return min(float(wait_seconds), max_wait)
+                except (ValueError, OverflowError):
                     # Try parsing as HTTP date
                     try:
                         retry_time = parsedate_to_datetime(retry_after)
                         assert isinstance(retry_time, datetime)
+                        # The asctime-date format (RFC 9110 §5.6.7) carries no timezone, so
+                        # `parsedate_to_datetime` returns a naive datetime; subtracting an aware
+                        # one raises `TypeError`, which would silently discard a valid header.
+                        if retry_time.tzinfo is None:
+                            retry_time = retry_time.replace(tzinfo=timezone.utc)
                         now = datetime.now(timezone.utc)
                         wait_seconds = (retry_time - now).total_seconds()
 

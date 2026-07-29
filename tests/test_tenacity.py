@@ -3,7 +3,7 @@ from __future__ import annotations as _annotations
 import asyncio
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import AsyncMock, Mock
@@ -569,6 +569,127 @@ class TestWaitRetryAfter:
         result = wait_func(retry_state)
 
         assert result == 300.0  # Capped at default max_wait
+
+    @pytest.mark.parametrize(
+        'retry_after',
+        [
+            pytest.param('-1', id='negative'),
+            pytest.param('-3600', id='large-negative'),
+            # `float(int(...))` raises OverflowError, not ValueError, for an integer that has no
+            # finite double representation; 10**309 is past the limit.
+            pytest.param('1' + '0' * 309, id='overflow'),
+        ],
+    )
+    def test_retry_after_invalid_seconds_uses_fallback(self, retry_after: str):
+        """A negative or unrepresentable Retry-After falls back instead of reaching tenacity.
+
+        Negative delta-seconds aren't defined by RFC 9110. Returning one made tenacity call
+        `time.sleep` with a negative duration, raising `ValueError: sleep length must be
+        non-negative` and masking the underlying `HTTPStatusError`. An astronomically large
+        value escaped as an unhandled `OverflowError`, since only `ValueError` was caught.
+        `ModelHTTPError.retry_after` already rejects both.
+        """
+        fallback = Mock(return_value=4.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': retry_after}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 4.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_retry_after_zero_seconds_is_honoured(self):
+        """`Retry-After: 0` means retry immediately, and must not be mistaken for "unparseable".
+
+        Guards the boundary of the negative-value rejection: `0` is a valid delta-seconds.
+        """
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '0'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 0.0
+        fallback.assert_not_called()
+
+    def test_retry_after_asctime_date_format(self):
+        """A future asctime HTTP-date is honoured rather than silently discarded.
+
+        `parsedate_to_datetime` returns a *naive* datetime for the asctime format (RFC 9110
+        §5.6.7 obs-date) because the string carries no timezone. Subtracting it from an aware
+        `datetime.now(timezone.utc)` raises `TypeError`, which the handler swallowed, so a
+        valid header fell through to the fallback strategy. `ModelHTTPError.retry_after`
+        normalises the same way.
+        """
+        fallback = Mock(return_value=4.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        future = datetime.now(timezone.utc) + timedelta(seconds=30)
+        # asctime format: 'Sun Nov  6 08:49:37 1994', carrying no timezone.
+        asctime_date = future.strftime('%a %b %d %H:%M:%S %Y')
+
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': asctime_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert 25 < result <= 30
+        fallback.assert_not_called()
+
+    def test_negative_retry_after_does_not_break_transport(self):
+        """End to end: a misbehaving server sending a negative Retry-After still surfaces the HTTP error.
+
+        Without the guard, `time.sleep(-5)` raised `ValueError` from inside tenacity, so the
+        caller saw an unrelated error instead of the 429.
+        """
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(429, headers={'retry-after': '-5'}, text='slow down')
+
+        transport = TenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(httpx.HTTPStatusError),
+                wait=wait_retry_after(fallback_strategy=wait_fixed(0)),
+                stop=stop_after_attempt(3),
+                reraise=True,
+            ),
+            wrapped=httpx.MockTransport(handler),
+            validate_response=lambda r: r.raise_for_status(),
+        )
+
+        with httpx.Client(transport=transport) as client:
+            with pytest.raises(httpx.HTTPStatusError, match='429 Too Many Requests'):
+                client.get('https://example.com/x')
+
+        assert attempts == 3
 
     def test_case_insensitive_header_access(self):
         """Test that Retry-After header access is case insensitive."""
