@@ -977,6 +977,41 @@ def test_strip_markdown_fences():
     assert strip_markdown_fences('```json\n{"a": {"b": {"c": 1}}}\n```') == '{"a": {"b": {"c": 1}}}'
 
 
+def test_strip_markdown_fences_partial_closing_fence():
+    """A streamed closing fence is seen part-written, and must still be stripped.
+
+    Streaming validates the text so far at every chunk boundary, so the three
+    backticks of the closing fence arrive as separate observations. Once the object
+    itself has closed, the value is already complete and the partial fence has to be
+    dropped -- otherwise it reaches `validate_json` and fails as invalid JSON.
+    """
+    obj = '{"city": "Mexico City"}'
+
+    assert strip_markdown_fences(f'```json\n{obj}\n`') == obj
+    assert strip_markdown_fences(f'```json\n{obj}\n``') == obj
+    assert strip_markdown_fences(f'```json\n{obj}\n```') == obj
+    # The fence may also be observed before its preceding newline arrives.
+    assert strip_markdown_fences(f'```json\n{obj}`') == obj
+    assert strip_markdown_fences(f'```json\r\n{obj}\r\n`') == obj
+    assert strip_markdown_fences(f'```json\r\n{obj}\r\n``') == obj
+
+    # Every prefix that already contains the closed object must yield exactly that
+    # object -- no prefix may leak a backtick through to the validator.
+    full = f'```json\n{obj}\n```'
+    for end in range(full.index('}') + 1, len(full) + 1):
+        assert strip_markdown_fences(full[:end]) == obj, full[:end]
+
+
+def test_strip_markdown_fences_partial_fence_keeps_boundaries():
+    """Accepting a partial fence must not resurrect the over-matching of #4397."""
+    # A one-backtick closing fence still ends the block, so trailing braces stay out.
+    assert strip_markdown_fences('```json\n{"a": 1}\n`\nContext: {"b": 2}') == '{"a": 1}'
+    # A lone backtick inside the fenced value is part of the value, not the fence.
+    assert strip_markdown_fences('```json\n{"tick": "`"}\n```') == '{"tick": "`"}'
+    # Still nothing to strip when the fence wraps something that is not an object.
+    assert strip_markdown_fences('```json\n[1, 2, 3]\n```') == '```json\n[1, 2, 3]\n```'
+
+
 class _AmbiguousBool:
     """Mimics the result of a numpy array comparison: its truth value is ambiguous."""
 
