@@ -868,7 +868,12 @@ def merge_json_schema_defs(schemas: list[dict[str, Any]]) -> tuple[list[dict[str
     return rewritten_schemas, all_defs
 
 
-_MARKDOWN_FENCES_PATTERN = re.compile(r'```(?:\w+)?\r?\n(\{.*?\})\s*(?:\r?\n?```|\Z)', flags=re.DOTALL)
+# The closing fence is matched as 1-3 backticks because a streamed response is
+# validated at every chunk boundary, so the fence is observed part-written: `\n``
+# and `\n``` are intermediate states of the same fence. Requiring all three made
+# those states match neither alternative, so the whole fence leaked into the
+# captured value even though the object itself had already closed.
+_MARKDOWN_FENCES_PATTERN = re.compile(r'```(?:\w+)?\r?\n(\{.*?\})\s*(?:\r?\n?`{1,3}|\Z)', flags=re.DOTALL)
 
 
 def strip_markdown_fences(text: str) -> str:
