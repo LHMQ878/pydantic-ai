@@ -30,9 +30,11 @@ from .. import _otel_messages
 from .._run_context import RunContext
 from .._warnings import PydanticAIDeprecationWarning
 from ..messages import (
+    BaseToolReturnPart,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
     ToolAvailabilityDeltaPart,
 )
@@ -191,17 +193,23 @@ class InstrumentationSettings:
         result: list[_otel_messages.ChatMessage] = []
         for message in messages:
             if isinstance(message, ModelRequest):
-                for is_system, group in itertools.groupby(
-                    message.parts, key=lambda p: isinstance(p, SystemPromptPart | ToolAvailabilityDeltaPart)
-                ):
+                def _request_part_role(part: object) -> _otel_messages.Role:
+                    if isinstance(part, SystemPromptPart):
+                        return 'system'
+                    if isinstance(part, BaseToolReturnPart):
+                        return 'tool'
+                    if isinstance(part, RetryPromptPart) and part.tool_name is not None:
+                        return 'tool'
+                    # ToolAvailabilityDeltaPart and other request parts are conversational.
+                    return 'user'
+
+                for role, group in itertools.groupby(message.parts, key=_request_part_role):
                     message_parts: list[_otel_messages.MessagePart] = []
                     for part in group:
                         if hasattr(part, 'otel_message_parts'):
                             message_parts.extend(part.otel_message_parts(self))
 
-                    result.append(
-                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
-                    )
+                    result.append(_otel_messages.ChatMessage(role=role, parts=message_parts))
             elif isinstance(message, ModelResponse):  # pragma: no branch
                 otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
                 if message.finish_reason is not None:

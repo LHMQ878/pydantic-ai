@@ -928,6 +928,41 @@ Fix the errors and try again.\
     )
 
 
+
+def test_messages_to_otel_messages_tool_return_uses_tool_role():
+    """Tool returns must use role=tool; availability deltas must not use system (#7235)."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        ToolAvailabilityDeltaPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.models.instrumented import InstrumentationSettings
+
+    settings = InstrumentationSettings(include_content=True)
+    history = [
+        ModelRequest(parts=[UserPromptPart(content='What is the weather?')]),
+        ModelResponse(parts=[ToolCallPart(tool_name='weather', args={'city': 'SP'}, tool_call_id='call_1')]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='weather', content='sunny', tool_call_id='call_1'),
+                ToolAvailabilityDeltaPart(tool_call_id='delta_1'),
+            ]
+        ),
+    ]
+    otel = settings.messages_to_otel_messages(history)
+    roles = [m['role'] for m in otel]
+    assert roles[0] == 'user'
+    assert roles[1] == 'assistant'
+    assert 'tool' in roles
+    tool_msgs = [m for m in otel if m['role'] == 'tool']
+    assert tool_msgs
+    assert any(p.get('type') == 'tool_call_response' for p in tool_msgs[0]['parts'])
+    assert all(m['role'] != 'system' for m in otel[1:])  # availability delta is not system mid-turn
+
+
 def test_messages_to_otel_message_parts_compaction_part():
     """CompactionPart is skipped in otel_message_parts (not a standard GenAI convention type)."""
     from pydantic_ai.messages import CompactionPart
@@ -1381,8 +1416,8 @@ def test_messages_without_content(document_content: BinaryContent):
                     {'type': 'tool_call', 'id': IsStr(), 'name': 'my_tool'},
                 ],
             },
-            {'role': 'user', 'parts': [{'type': 'tool_call_response', 'id': 'tool_call_1', 'name': 'tool'}]},
-            {'role': 'user', 'parts': [{'type': 'tool_call_response', 'id': 'tool_call_2', 'name': 'tool'}]},
+            {'role': 'tool', 'parts': [{'type': 'tool_call_response', 'id': 'tool_call_1', 'name': 'tool'}]},
+            {'role': 'tool', 'parts': [{'type': 'tool_call_response', 'id': 'tool_call_2', 'name': 'tool'}]},
             {'role': 'user', 'parts': [{'type': 'text'}, {'type': 'blob', 'mime_type': 'application/pdf'}]},
             {'role': 'user', 'parts': [{'type': 'text'}]},
             {'role': 'assistant', 'parts': [{'type': 'blob', 'mime_type': 'application/pdf'}]},
