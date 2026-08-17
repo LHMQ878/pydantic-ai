@@ -18285,6 +18285,106 @@ async def test_enqueue_priorities_stay_separate_when_both_drain_at_end_of_run():
     assert all(len([p for p in r.parts if isinstance(p, UserPromptPart)]) == 1 for r in drained)
 
 
+async def test_pending_messages_do_not_discard_a_deferred_tool_pause():
+    """A queued message must not turn a `DeferredToolRequests` pause into another model turn.
+
+    A `DeferredToolRequests` end is a pause the caller has to resolve, not a final answer. If the
+    drain redirected it like an ordinary `End`, the caller would never see the requests, the
+    approval-requiring call would be left without a `ToolReturnPart`, and the model would keep
+    going as if approval hadn't been needed.
+
+    Not a VCR test: the trigger is a queued message coexisting with an unapproved call in one step,
+    which no recording pins down — `FunctionModel` makes the second turn observable by returning
+    text only reachable if the pause was discarded.
+    """
+    call_count = 0
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='inject_msg', args='{}'),
+                    ToolCallPart(tool_name='delete_everything', args='{}'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        # Only reachable if the run did not pause for approval.
+        return ModelResponse(
+            parts=[TextPart(content='kept going without approval')],
+            usage=RequestUsage(input_tokens=10, output_tokens=5),
+        )
+
+    agent = Agent(FunctionModel(model_fn), output_type=[str, DeferredToolRequests])
+
+    @agent.tool
+    def inject_msg(ctx: RunContext[object]) -> str:
+        ctx.enqueue('heads up: maintenance window tonight')
+        return 'ok'
+
+    @agent.tool_plain(requires_approval=True)
+    def delete_everything() -> str:
+        return 'deleted'
+
+    result = await agent.run('Hello')
+
+    assert call_count == 1
+    requests = result.output
+    assert isinstance(requests, DeferredToolRequests)
+    assert [call.tool_name for call in requests.approvals] == ['delete_everything']
+    # The queued message did not become a new user turn, so the history ends at the pause.
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+                conversation_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='inject_msg', args='{}', tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='delete_everything', args='{}', tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+                model_name='function:model_fn:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+                conversation_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='inject_msg',
+                        content='ok',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+                conversation_id=IsStr(),
+            ),
+        ]
+    )
+
+    # Resuming answers the approval request, so the call doesn't dangle in the history.
+    approval_call_id = requests.approvals[0].tool_call_id
+    resumed = await agent.run(
+        message_history=result.all_messages(),
+        deferred_tool_results=DeferredToolResults(approvals={approval_call_id: True}),
+    )
+    assert resumed.output == 'kept going without approval'
+    assert [
+        (part.tool_name, part.content)
+        for message in resumed.new_messages()
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ] == [('delete_everything', 'deleted')]
+
+
 # --- Output hook tests ---
 
 

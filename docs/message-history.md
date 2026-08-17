@@ -672,6 +672,10 @@ loop all deliver enqueued messages.
       system-prompt callback that re-enqueues on each reinjection), the run will
       loop indefinitely. Set [`UsageLimits`][pydantic_ai.usage.UsageLimits] on the
       run as a safety net.
+    - A run that ends by returning [`DeferredToolRequests`][pydantic_ai.tools.DeferredToolRequests]
+      is paused, not finished, so it isn't redirected into another model request: the caller needs
+      to resolve the requests and resume. Anything still queued at that point stays behind with the
+      run, so enqueue again on the resuming run if the content still applies.
     - `enqueue` is designed to be called from the same event loop that drives the
       agent run. Inside the run that's automatic: async tools, sync tools (which
       Pydantic AI auto-wraps in a thread executor), and capability hooks all

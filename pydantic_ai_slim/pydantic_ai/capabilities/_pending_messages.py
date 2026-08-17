@@ -10,7 +10,7 @@ from pydantic_ai._utils import fill_run_metadata
 from pydantic_ai.capabilities.abstract import AbstractCapability, CapabilityOrdering
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import EnqueuedMessagesEvent, ModelMessage, ModelRequest
-from pydantic_ai.tools import RunContext
+from pydantic_ai.tools import DeferredToolRequests, RunContext
 from pydantic_graph import End
 
 if TYPE_CHECKING:
@@ -132,8 +132,16 @@ class PendingMessageDrainCapability(AbstractCapability[Any]):
         redirect. Emits one
         [`EnqueuedMessagesEvent`][pydantic_ai.messages.EnqueuedMessagesEvent] per drained
         [`enqueue`][pydantic_ai.tools.RunContext.enqueue] call, in enqueue order.
+
+        A [`DeferredToolRequests`][pydantic_ai.tools.DeferredToolRequests] end is a pause, not a
+        termination: the caller has to receive the requests, resolve them, and resume the run. It's
+        returned untouched, the way a non-`End` result is, so queued messages never cost the caller
+        their pause (and the deferred calls their results).
         """
         if not isinstance(result, End):
+            return result
+
+        if isinstance(result.data.output, DeferredToolRequests):
             return result
 
         assert ctx.pending_messages is not None, 'drain runs during an agent run, which always has a queue'
